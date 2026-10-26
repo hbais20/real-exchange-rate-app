@@ -42,6 +42,11 @@ ER_FLOW = "ER"     # IMF.STA dataflow: Exchange Rates
 CPI_KEY = "{iso}.CPI._T.IX.M"        # all-items CPI, index, monthly
 ER_KEY = "{iso}.XDC_USD.PA_RT.M"     # local currency per USD, period average, monthly
 
+# Fallback keys used when the exact CPI key returns nothing.  "*" is the SDMX
+# wildcard.  First: any CPI series for the country; then: any monthly *index*
+# series of any index type (e.g. a harmonised index such as HICP).
+CPI_DISCOVERY_KEYS = ["{iso}.CPI.*.*.M", "{iso}.*.*.IX.M"]
+
 EURO_AREA = "G163"                    # IMF code for the Euro area
 EARLIEST = pd.Timestamp("1976-01-01")  # we only use data from Jan 1976 onward
 
@@ -92,6 +97,7 @@ class FetchResult:
     series: pd.Series
     message: str | None = None                    # user-facing explanation when series is empty
     debug: list[dict] = field(default_factory=list)  # one entry per URL attempted
+    note: str | None = None                       # shown to the user when a fallback series was used
 
 
 # ---------------------------------------------------------------------------
@@ -153,74 +159,55 @@ def _parse_period(text) -> pd.Timestamp | None:
     return pd.Timestamp(year=year, month=month, day=1)
 
 
-def _find_time_values(payload: dict, root: dict) -> list[str]:
+def _find_dimensions(payload: dict, root: dict) -> tuple[list, list]:
     """
-    Locate the list of TIME_PERIOD values in an SDMX-JSON message.
+    Locate the (series-level, observation-level) dimension lists of an SDMX-JSON message.
 
     Handles both layouts:
-      * SDMX-JSON 2.0: root["structures"][0]["dimensions"]["observation"]
-      * SDMX-JSON 1.0: root["structure"]["dimensions"]["observation"]
+      * SDMX-JSON 2.0: root["structures"][0]["dimensions"]
+      * SDMX-JSON 1.0: root["structure"]["dimensions"]
     """
     candidates = []
     for container in (root, payload):
-        for s in container.get("structures") or []:
-            candidates.append(s)
+        candidates += [s for s in (container.get("structures") or []) if isinstance(s, dict)]
         if isinstance(container.get("structure"), dict):
             candidates.append(container["structure"])
-
     for structure in candidates:
-        dims = structure.get("dimensions") or {}
-        # Time is normally an observation-level dimension; also check series-level to be safe.
-        for level in ("observation", "series"):
-            for dim in dims.get(level) or []:
-                if dim.get("id") == "TIME_PERIOD":
-                    return [str(v.get("id") or v.get("value") or v.get("name") or "")
-                            for v in dim.get("values", [])]
+        dims = structure.get("dimensions")
+        if isinstance(dims, dict):
+            return dims.get("series") or [], dims.get("observation") or []
+    return [], []
+
+
+def _time_values(series_dims: list, obs_dims: list) -> list[str]:
+    """Return the TIME_PERIOD codes (e.g. "2020-M01") in index order, or []."""
+    for dims in (obs_dims, series_dims):
+        for dim in dims:
+            if isinstance(dim, dict) and dim.get("id") == "TIME_PERIOD":
+                return [str(v.get("id") or v.get("value") or v.get("name") or "")
+                        for v in dim.get("values", [])]
     return []
 
 
-def _parse_sdmx_json(payload: dict) -> pd.Series:
-    """
-    Turn an SDMX-JSON data message into a monthly Series (DatetimeIndex, float).
+def _series_dims(series_key: str, series_dims: list) -> dict[str, str]:
+    """Decode a series key like "0:2:1:0:0" into {"COUNTRY": "G163", ...}."""
+    out: dict[str, str] = {}
+    for i, part in enumerate(str(series_key).split(":")):
+        try:
+            dim = series_dims[i]
+            val = dim["values"][int(part)]
+            out[str(dim.get("id", f"DIM{i}"))] = str(val.get("id") or val.get("value")
+                                                    or val.get("name") or "")
+        except (IndexError, ValueError, KeyError, TypeError, AttributeError):
+            continue
+    return out
 
-    Expected shape (both v1.0 and v2.0 variants are accepted):
-        dataSets[0].series["0:0:0:0"].observations["<time idx>"] = [value, ...]
-        structure(s).dimensions.observation -> TIME_PERIOD.values[i].id = "2020-M01"
-    With a fully specified key there is one series; if several are present we
-    keep the one with the most observations.  Anything unreadable yields an
-    EMPTY Series (never an exception).
-    """
-    if not isinstance(payload, dict):
-        return _empty_series()
 
-    root = payload.get("data", payload)
-    if not isinstance(root, dict):
-        return _empty_series()
-
-    datasets = root.get("dataSets") or []
-    if not datasets or not isinstance(datasets[0], dict):
-        return _empty_series()
-    dataset = datasets[0]
-
-    periods = _find_time_values(payload, root)
-    if not periods:
-        return _empty_series()
-
-    # Collect observations as {time_index: raw_value}.
-    best: dict = {}
-    for series in (dataset.get("series") or {}).values():
-        obs = (series or {}).get("observations") or {}
-        if len(obs) > len(best):
-            best = obs
-
-    # Fallback: "flat" layout where observations sit directly in the dataset and
-    # keys look like "0:0:0:0:17" (the last number is the time index).
-    if not best and dataset.get("observations"):
-        best = {str(k).split(":")[-1]: v for k, v in dataset["observations"].items()}
-
+def _obs_to_series(observations: dict, periods: list[str]) -> pd.Series:
+    """Convert {"<time idx>": [value, ...]} to a monthly Series (empty if nothing usable)."""
     dates: list[pd.Timestamp] = []
     values: list[float] = []
-    for idx, vals in best.items():
+    for idx, vals in (observations or {}).items():
         try:
             ts = _parse_period(periods[int(idx)])
             raw = vals[0] if isinstance(vals, (list, tuple)) else vals
@@ -230,28 +217,70 @@ def _parse_sdmx_json(payload: dict) -> pd.Series:
         if ts is not None and value == value:  # value == value drops NaN
             dates.append(ts)
             values.append(value)
-
     if not dates:
         return _empty_series()
-
     out = pd.Series(values, index=pd.DatetimeIndex(dates), dtype=float)
     out = out[~out.index.duplicated(keep="last")].sort_index()
     return out[out.index >= EARLIEST]
 
 
-@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def fetch_series(flow: str, key: str) -> FetchResult:
+def _extract_series_list(payload) -> list[tuple[dict[str, str], pd.Series]]:
     """
-    Download one monthly series from the IMF.
+    Read EVERY non-empty series in an SDMX-JSON data message.
 
-    Always returns a FetchResult:
-      * series  - the data (possibly EMPTY, always with a DatetimeIndex)
-      * message - plain-English reason when the series is empty
-      * debug   - URL / status / first 500 characters of every response received
-
-    Raises IMFError only when the API cannot be reached at all (not cached,
-    so the next run retries).
+    Returns [(dimension_values, Series), ...].  Expected shape (v1.0 and v2.0 accepted):
+        dataSets[0].series["0:0:0:0:0"].observations["<time idx>"] = [value, ...]
+        structure(s).dimensions.series      -> descriptions of the series key parts
+        structure(s).dimensions.observation -> TIME_PERIOD.values[i].id = "2020-M01"
+    Never raises: unreadable input gives [].
     """
+    if not isinstance(payload, dict):
+        return []
+    root = payload.get("data", payload)
+    if not isinstance(root, dict):
+        return []
+    datasets = root.get("dataSets") or []
+    if not datasets or not isinstance(datasets[0], dict):
+        return []
+    dataset = datasets[0]
+
+    series_dims, obs_dims = _find_dimensions(payload, root)
+    periods = _time_values(series_dims, obs_dims)
+    if not periods:
+        return []
+
+    found = []
+    for skey, sval in (dataset.get("series") or {}).items():
+        s = _obs_to_series((sval or {}).get("observations") or {}, periods)
+        if not s.empty:
+            found.append((_series_dims(skey, series_dims), s))
+
+    # Fallback: "flat" layout, keys like "0:0:0:0:17" (last number = time index).
+    if not found and dataset.get("observations"):
+        flat = {str(k).split(":")[-1]: v for k, v in dataset["observations"].items()}
+        s = _obs_to_series(flat, periods)
+        if not s.empty:
+            found.append(({}, s))
+    return found
+
+
+def _parse_sdmx_json(payload) -> pd.Series:
+    """Single-series convenience wrapper: the series with the most observations, or empty."""
+    found = _extract_series_list(payload)
+    return max(found, key=lambda e: len(e[1]))[1] if found else _empty_series()
+
+
+def _request(flow: str, key: str):
+    """
+    Query the IMF for `key` (wildcards "*" allowed) trying each endpoint in turn.
+
+    Returns (entries, debug, reasons, errors):
+      entries - [(dims, Series), ...] from the first endpoint that returned data
+      debug   - URL / status / first 500 characters of every response received
+      reasons - why endpoints that answered had no usable data
+      errors  - network-level failures
+    """
+    key21 = key.replace("*", "")  # SDMX 2.1 wildcard = empty key segment
     candidates = [
         # SDMX 3.0: /data/{context}/{agency}/{resource}/{version}/{key}
         (f"{IMF_BASE}/data/dataflow/IMF.STA/{flow}/+/{key}",
@@ -259,7 +288,7 @@ def fetch_series(flow: str, key: str) -> FetchResult:
         (f"{IMF_BASE}/data/dataflow/IMF.STA/{flow}/+/{key}",
          {"Accept": "application/json"}),
         # SDMX 2.1 fallback on the same host
-        (f"{IMF_BASE_21}/data/IMF.STA,{flow}/{key}",
+        (f"{IMF_BASE_21}/data/IMF.STA,{flow}/{key21}",
          {"Accept": "application/vnd.sdmx.data+json;version=1.0.0"}),
     ]
     debug: list[dict] = []
@@ -279,9 +308,9 @@ def fetch_series(flow: str, key: str) -> FetchResult:
                       "snippet": resp.snippet})
 
         if resp.status == 200 and resp.payload is not None:
-            series = _parse_sdmx_json(resp.payload)
-            if not series.empty:
-                return FetchResult(series, None, debug)
+            entries = _extract_series_list(resp.payload)
+            if entries:
+                return entries, debug, reasons, errors
             reasons.append("the IMF answered (HTTP 200) but the response contained no monthly "
                            "observations I could read")
         elif resp.status == 200:
@@ -290,12 +319,96 @@ def fetch_series(flow: str, key: str) -> FetchResult:
             reasons.append("the IMF reports no data for this key (HTTP 404)")
         else:
             reasons.append(f"unexpected HTTP {resp.status}")
+    return [], debug, reasons, errors
 
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_series(flow: str, key: str) -> FetchResult:
+    """
+    Download one monthly series from the IMF.
+
+    Always returns a FetchResult (series possibly EMPTY but always with a
+    DatetimeIndex, a plain-English message, and debug info).  Raises IMFError
+    only when the API cannot be reached at all (not cached, so a rerun retries).
+    """
+    entries, debug, reasons, errors = _request(flow, key)
+    if entries:
+        return FetchResult(max(entries, key=lambda e: len(e[1]))[1], None, debug)
     if not reasons and errors:
         raise IMFError("; ".join(errors))
-
     message = (reasons[0] if reasons else "no data returned")
     message += f" (key {key}). See the debug expander for the raw response"
+    return FetchResult(_empty_series(), message, debug)
+
+
+# ---------------------------------------------------------------------------
+# CPI with automatic discovery fallback
+# ---------------------------------------------------------------------------
+
+def _describe(dims: dict[str, str], s: pd.Series) -> str:
+    """Short human-readable label for a discovered series."""
+    label = ", ".join(f"{k}={v}" for k, v in dims.items()) or "unlabelled series"
+    return f"{label} [{s.index.min():%Y-%m} to {s.index.max():%Y-%m}]"
+
+
+def _pick_index_series(entries):
+    """
+    Choose the best monthly CPI *index* among discovered series, or None.
+
+    Only series whose dimensions include the index transformation "IX" are
+    eligible (growth rates are not usable for a real exchange rate).  Preference:
+    all-items ("_T") > index type "CPI" > longest history.
+    """
+    best, best_score = None, None
+    for dims, s in entries:
+        values = set(dims.values())
+        if "IX" not in values:
+            continue
+        score = (("_T" in values) * 2 + ("CPI" in values), len(s))
+        if best_score is None or score > best_score:
+            best, best_score = (dims, s), score
+    return best
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def fetch_cpi(iso: str) -> FetchResult:
+    """
+    Fetch the monthly all-items CPI index for `iso`.
+
+    1. Try the exact key {iso}.CPI._T.IX.M.
+    2. If the IMF returns nothing, discover what CPI series exist using
+       wildcard keys (CPI_DISCOVERY_KEYS) and use a monthly index series if
+       one is found, setting `note` so the user knows a substitute was used.
+    3. Otherwise return an empty series with a clear `message`.
+    """
+    exact_key = CPI_KEY.format(iso=iso)
+    direct = fetch_series(CPI_FLOW, exact_key)      # may raise IMFError
+    if not direct.series.empty:
+        return direct
+
+    debug = list(direct.debug)
+    seen: list[str] = []
+    for template in CPI_DISCOVERY_KEYS:
+        key = template.format(iso=iso)
+        entries, dbg, _reasons, _errors = _request(CPI_FLOW, key)
+        debug += dbg
+        pick = _pick_index_series(entries)
+        if pick is not None:
+            dims, s = pick
+            note = (f"The IMF has no series for key {exact_key}, so the app searched with the "
+                    f"wildcard key {key} and used: {_describe(dims, s)}.")
+            return FetchResult(s, None, debug, note)
+        seen += [_describe(d, s) for d, s in entries]
+
+    if seen:
+        detail = ("Series found, but none is a monthly CPI index: " + "; ".join(seen[:8]) + ".")
+    else:
+        detail = "A wildcard search of the IMF CPI dataflow also returned no series."
+    message = f"no monthly CPI index series could be found for {iso}. {detail}"
+    if iso == EURO_AREA:
+        message += (" Euro area CPI may be unavailable from the IMF; consider using individual "
+                    "euro-area member countries instead.")
+    message += " See the debug expander for the raw responses"
     return FetchResult(_empty_series(), message, debug)
 
 
@@ -333,10 +446,10 @@ def fetch_country_list() -> tuple[dict[str, str], bool]:
 # Data loading and calculations
 # ---------------------------------------------------------------------------
 
-def load_series(flow: str, key: str) -> tuple[FetchResult | None, str | None]:
-    """Fetch a series; return (result, None) or (None, user-facing message)."""
+def load_series(fetch_fn, *args) -> tuple[FetchResult | None, str | None]:
+    """Run a fetch function; return (result, None) or (result_or_None, user-facing message)."""
     try:
-        result = fetch_series(flow, key)
+        result = fetch_fn(*args)
     except IMFError as exc:
         return None, f"Could not reach the IMF API ({exc})"
     if result.series.empty:
@@ -348,28 +461,33 @@ def build_dataset(iso1: str, iso2: str, names: dict[str, str]):
     """
     Download CPI and exchange rates for both countries and combine them.
 
-    Returns (DataFrame | None, problems, coverage, debug):
+    Returns (DataFrame | None, problems, coverage, debug, notes):
       * DataFrame has columns S, P1, P2, RER on a monthly index
       * problems  - user-facing messages for series that could not be used
       * coverage  - first/last month and count for each series that loaded
       * debug     - raw-response previews for the debug expander
+      * notes     - messages about substitute (fallback) series that were used
     """
     problems: list[str] = []
     coverage: list[dict] = []
     debug: list[dict] = []
+    notes: list[str] = []
     loaded: dict[str, pd.Series] = {}
 
-    jobs = []
+    jobs = []  # (tag, label, fetch function, arguments)
     for tag, iso in (("1", iso1), ("2", iso2)):
-        jobs.append((f"P{tag}", f"CPI - {names[iso]}", CPI_FLOW, CPI_KEY.format(iso=iso)))
+        jobs.append((f"P{tag}", f"CPI - {names[iso]}", fetch_cpi, (iso,)))
         # The USD is the numeraire, so USA's rate per USD is 1 by definition.
         if iso != "USA":
-            jobs.append((f"E{tag}", f"Exchange rate - {names[iso]}", ER_FLOW, ER_KEY.format(iso=iso)))
+            jobs.append((f"E{tag}", f"Exchange rate - {names[iso]}", fetch_series,
+                         (ER_FLOW, ER_KEY.format(iso=iso))))
 
-    for tag, label, flow, key in jobs:
-        result, problem = load_series(flow, key)
+    for tag, label, fn, args in jobs:
+        result, problem = load_series(fn, *args)
         if result is not None:
             debug.extend({"series": label, **d} for d in result.debug)
+            if result.note:
+                notes.append(f"**{label}**: {result.note}")
         if problem is not None:
             problems.append(f"**{label}**: {problem}.")
             continue
@@ -380,7 +498,7 @@ def build_dataset(iso1: str, iso2: str, names: dict[str, str]):
                          "Observations": len(series)})
 
     if problems:
-        return None, problems, coverage, debug
+        return None, problems, coverage, debug, notes
 
     # Local currency per USD (USA = 1).
     er = {}
@@ -396,7 +514,7 @@ def build_dataset(iso1: str, iso2: str, names: dict[str, str]):
     df = df.sort_index()
     df["S"] = df["E2"] / df["E1"]               # Country 2 units per Country 1 unit
     df["RER"] = df["S"] * df["P1"] / df["P2"]
-    return df[["S", "P1", "P2", "RER"]], [], coverage, debug
+    return df[["S", "P1", "P2", "RER"]], [], coverage, debug, notes
 
 
 def compute_sample(df: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp):
@@ -492,9 +610,15 @@ def main() -> None:
         st.info("Please choose two different countries.")
         st.stop()
 
+    if EURO_AREA in (iso1, iso2):
+        st.info("ℹ️ **Euro area CPI may be unavailable from the IMF.** If the exact series is "
+                "missing, the app searches for any other monthly CPI index for the Euro area "
+                "and tells you which one it used; if none exists, you will see a message and "
+                "can pick individual euro-area countries instead.")
+
     # ---- Download and combine data ----------------------------------------
     with st.spinner("Fetching data from the IMF..."):
-        df, problems, coverage, debug = build_dataset(iso1, iso2, countries)
+        df, problems, coverage, debug, notes = build_dataset(iso1, iso2, countries)
 
     if df is None:
         st.error("Data could not be loaded for this pair:")
@@ -506,6 +630,8 @@ def main() -> None:
         render_debug(debug)
         st.stop()
 
+    for note in notes:
+        st.warning(f"Substitute series used. {note}")
     render_debug(debug)
 
     valid_months = df.dropna().index
